@@ -1124,6 +1124,16 @@ public enum QuantizationMode: String, Codable, Sendable {
     case mxfp8
 
     case nvfp4
+
+    /// NF4 (4-bit NormalFloat) quantization.
+    ///
+    /// Each group of 32, 64 or 128 weights stores a `float16` absmax scale and no bias;
+    /// every 4-bit code indexes a fixed 16-entry codebook. Codes pack 8 per `uint32`,
+    /// first code in the low nibble, as in 4-bit ``affine``.
+    ///
+    /// ### See Also
+    /// - https://arxiv.org/abs/2305.14314
+    case nf4
 }
 
 /// Dequantize the matrix `w` using the provided `scales` and
