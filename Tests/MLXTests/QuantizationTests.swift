@@ -308,6 +308,40 @@ class QuantizationTests: XCTestCase {
         }
     }
 
+    func testNF4SmallMMatchesLUTInFloat32() {
+        let shapes = [(k: 704, n: 100), (k: 2816, n: 72), (k: 1056, n: 9), (k: 5120, n: 64)]
+        for groupSize in [32, 64, 128] {
+            for (k, n) in shapes where k % groupSize == 0 {
+                let weight = Self.nf4TestWeight(rows: n, columns: k, dtype: .float32)
+                let (codes, scales, _) = MLX.quantized(
+                    weight, groupSize: groupSize, bits: 4, mode: .nf4)
+                let dense = dequantized(
+                    codes, scales: scales, biases: nil, groupSize: groupSize, bits: 4,
+                    mode: .nf4, dtype: .float32)
+                for m in [1, 2, 3, 4, 5, 6, 8, 12] {
+                    MLXRandom.seed(UInt64(m + k))
+                    let x = MLXRandom.normal([m, k])
+                    let expected = matmul(x, dense.T, stream: .cpu)
+                    let actual = quantizedMM(
+                        x, codes, scales: scales, biases: nil, groupSize: groupSize, bits: 4,
+                        mode: .nf4)
+                    XCTAssertLessThan(
+                        Self.relativeMaxError(actual, expected), 1e-5,
+                        "g\(groupSize) k\(k) n\(n) m\(m)")
+                }
+                let experts = MLXArray([UInt32(0), 0, 0])
+                let xg = MLXRandom.normal([3, 1, k])
+                let gathered = gatherQuantizedMM(
+                    xg, codes.expandedDimensions(axis: 0),
+                    scales: scales.expandedDimensions(axis: 0),
+                    rhsIndices: experts, groupSize: groupSize, bits: 4, mode: .nf4)
+                XCTAssertLessThan(
+                    Self.relativeMaxError(gathered, matmul(xg, dense.T, stream: .cpu)), 1e-5,
+                    "gather g\(groupSize) k\(k) n\(n)")
+            }
+        }
+    }
+
     func testNF4QuantizedMMNotTransposed() {
         MLXRandom.seed(4)
         let weight = MLXRandom.normal([512, 256]) * 0.05
@@ -443,8 +477,19 @@ class QuantizationTests: XCTestCase {
             ProcessInfo.processInfo.environment["MLX_NF4_BENCH"] == "1", "set MLX_NF4_BENCH=1")
         let samples = 7
         let cacheDefeatBytes = 256 << 20
-        let shapes = [(5120, 17408), (17408, 5120), (5120, 10240), (6144, 5120)]
-        let configurations: [(QuantizationMode, Int)] = [(.nf4, 32), (.affine, 64)]
+        let allShapes = [
+            (5120, 17408), (17408, 5120), (5120, 10240), (6144, 5120),
+            (2816, 262_144), (2816, 2112), (2112, 2816), (2816, 4096), (4096, 2816),
+            (2048, 65536), (2048, 2048),
+        ]
+        let shapes =
+            ProcessInfo.processInfo.environment["MLX_NF4_BENCH_SHAPES"] == "small"
+            ? Array(allShapes[4...])
+            : ProcessInfo.processInfo.environment["MLX_NF4_BENCH_SHAPES"] == "all"
+                ? allShapes : Array(allShapes[..<4])
+        let configurations: [(QuantizationMode, Int)] =
+            ProcessInfo.processInfo.environment["MLX_NF4_BENCH_MXFP4"] == "1"
+            ? [(.nf4, 32), (.affine, 64), (.mxfp4, 32)] : [(.nf4, 32), (.affine, 64)]
 
         func median(_ body: () -> Void) -> Double {
             let clock = ContinuousClock()
@@ -456,11 +501,14 @@ class QuantizationTests: XCTestCase {
             return times.sorted()[samples / 2]
         }
 
+        let env = ProcessInfo.processInfo.environment
+        let ms = (env["MLX_NF4_BENCH_MS"] ?? "1,2,4,8").split(separator: ",").compactMap { Int($0) }
+        let reps = Int(env["MLX_NF4_BENCH_REPS"] ?? "1") ?? 1
         print("K x N | M | nf4 g32 us | affine g64 us | nf4/affine")
         for (k, n) in shapes {
             MLXRandom.seed(1)
             let dense = MLXRandom.normal([n, k], dtype: .bfloat16) * 0.02
-            var micros: [Int: [Double]] = [:]
+            var measures: [(Int) -> Double] = []
             for (mode, groupSize) in configurations {
                 let first = MLX.quantized(dense, groupSize: groupSize, bits: 4, mode: mode)
                 eval([first.wq, first.scales] + (first.biases.map { [$0] } ?? []))
@@ -472,7 +520,8 @@ class QuantizationTests: XCTestCase {
                     copies.append(copy)
                 }
                 let rounds = max(1, 16 / copies.count)
-                for m in [1, 2, 4, 8] {
+                measures.append { m in
+                    MLXRandom.seed(UInt64(m))
                     let x = MLXRandom.normal([m, k], dtype: .bfloat16)
                     let run = {
                         var outputs: [MLXArray] = []
@@ -487,16 +536,137 @@ class QuantizationTests: XCTestCase {
                         eval(outputs)
                     }
                     run()
-                    micros[m, default: []].append(
-                        median(run) / Double(rounds * copies.count))
+                    return median(run) / Double(rounds * copies.count)
                 }
             }
-            for m in [1, 2, 4, 8] {
-                let (nf4, affine) = (micros[m]![0], micros[m]![1])
+            for m in ms {
+                var samples = Array(repeating: [Double](), count: measures.count)
+                for _ in 0 ..< reps {
+                    for (i, measure) in measures.enumerated() { samples[i].append(measure(m)) }
+                }
+                let micros = samples.map { $0.sorted()[$0.count / 2] }
+                let (nf4, affine) = (micros[0], micros[1])
+                let extra =
+                    micros.count > 2
+                    ? String(format: " | mxfp4/affine %.3f", micros[2] / affine) : ""
                 print(
                     "\(k) x \(n) | \(m) | "
-                        + String(format: "%.1f | %.1f | %.3f", nf4, affine, nf4 / affine))
+                        + String(format: "%.1f | %.1f | %.3f", nf4, affine, nf4 / affine) + extra)
             }
         }
     }
+
+    func testNF4GatherBenchmark() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MLX_NF4_BENCH"] == "1", "set MLX_NF4_BENCH=1")
+        let samples = 7
+        let shapes = [
+            (128, 8, 2816, 704), (128, 8, 704, 2816), (128, 8, 2816, 1408),
+            (64, 4, 2048, 1536), (64, 4, 1536, 2048),
+        ]
+        let configurations: [(QuantizationMode, Int)] = [(.nf4, 32), (.affine, 64)]
+        func median(_ body: () -> Void) -> Double {
+            let clock = ContinuousClock()
+            let times = (0 ..< samples).map { _ in
+                let elapsed = clock.measure(body)
+                return Double(elapsed.components.seconds) * 1e6
+                    + Double(elapsed.components.attoseconds) / 1e12
+            }
+            return times.sorted()[samples / 2]
+        }
+        print("gather E/topk K x N | nf4 g32 us | affine g64 us | nf4/affine")
+        for (experts, topk, k, n) in shapes {
+            MLXRandom.seed(1)
+            let dense = MLXRandom.normal([experts, n, k], dtype: .bfloat16) * 0.02
+            let x = MLXRandom.normal([topk, 1, k], dtype: .bfloat16)
+            let indexSets = (0 ..< 32).map { i in
+                MLXArray((0 ..< topk).map { UInt32(($0 * 37 + i * 11) % experts) })
+            }
+            eval(indexSets)
+            var measures: [() -> Double] = []
+            for (mode, groupSize) in configurations {
+                let (wq, scales, biases) = MLX.quantized(
+                    dense, groupSize: groupSize, bits: 4, mode: mode)
+                eval([wq, scales] + (biases.map { [$0] } ?? []))
+                let run = {
+                    eval(
+                        indexSets.map {
+                            gatherQuantizedMM(
+                                x, wq, scales: scales, biases: biases, rhsIndices: $0,
+                                groupSize: groupSize, bits: 4, mode: mode)
+                        })
+                }
+                run()
+                measures.append { median(run) / Double(indexSets.count) }
+            }
+            let reps = Int(ProcessInfo.processInfo.environment["MLX_NF4_BENCH_REPS"] ?? "1") ?? 1
+            var samples = Array(repeating: [Double](), count: measures.count)
+            for _ in 0 ..< reps {
+                for (i, measure) in measures.enumerated() { samples[i].append(measure()) }
+            }
+            let micros = samples.map { $0.sorted()[$0.count / 2] }
+            print(
+                "\(experts)/\(topk) \(k) x \(n) | "
+                    + String(
+                        format: "%.1f | %.1f | %.3f", micros[0], micros[1], micros[0] / micros[1]))
+        }
+    }
+
+    func testModeOutputHashes() throws {
+        let path = ProcessInfo.processInfo.environment["MLX_NF4_HASHES"] ?? ""
+        try XCTSkipIf(path.isEmpty, "set MLX_NF4_HASHES to an output file")
+        func hash(_ a: MLXArray) -> String {
+            var h: UInt64 = 0xcbf2_9ce4_8422_2325
+            for v in a.asType(.float32).asArray(Float.self) {
+                h = (h ^ UInt64(v.bitPattern)) &* 0x100_0000_01b3
+            }
+            return String(h, radix: 16)
+        }
+        var lines: [String] = []
+        var configurations: [(QuantizationMode, Int, Int)] = [
+            (.mxfp4, 32, 4), (.mxfp8, 32, 8), (.nvfp4, 16, 4),
+        ]
+        for g in [32, 64, 128] {
+            for b in [2, 3, 4, 5, 6, 8] { configurations.append((.affine, g, b)) }
+        }
+        for (mode, g, b) in configurations {
+            for (k, n) in [(128, 96), (512, 256), (1024, 520), (2816, 704)] {
+                MLXRandom.seed(UInt64(k + n + g + b))
+                let weight = MLXRandom.normal([4, n, k]) * 0.05
+                let (wq, scales, biases) = MLX.quantized(weight, groupSize: g, bits: b, mode: mode)
+                let tag = "\(mode) g\(g) b\(b) \(k)x\(n)"
+                lines.append(
+                    "\(tag) deq \(hash(dequantized(wq, scales: scales, biases: biases, groupSize: g, bits: b, mode: mode)))"
+                )
+                for m in [1, 2, 3, 4, 5, 8, 13, 33] {
+                    for dtype in [DType.bfloat16, .float16] {
+                        let x = MLXRandom.normal([m, k]).asType(dtype)
+                        let w2 = wq[0]
+                        let s2 = scales[0]
+                        let b2 = biases?[0]
+                        lines.append(
+                            "\(tag) mm m\(m) \(dtype) \(hash(quantizedMM(x, w2, scales: s2, biases: b2, groupSize: g, bits: b, mode: mode)))"
+                        )
+                        let xt = MLXRandom.normal([m, n]).asType(dtype)
+                        lines.append(
+                            "\(tag) mmT m\(m) \(dtype) \(hash(quantizedMM(xt, w2, scales: s2, biases: b2, transpose: false, groupSize: g, bits: b, mode: mode)))"
+                        )
+                    }
+                    let rhs = MLXArray((0 ..< 6).map { UInt32(($0 * 3 + 1) % 4) })
+                    let xg = MLXRandom.normal([6, m, k]).asType(.bfloat16)
+                    lines.append(
+                        "\(tag) gather m\(m) \(hash(gatherQuantizedMM(xg, wq, scales: scales, biases: biases, rhsIndices: rhs, groupSize: g, bits: b, mode: mode)))"
+                    )
+                }
+                let sortedRhs = MLXArray((0 ..< 64).map { UInt32($0 * 4 / 64) })
+                let xs = MLXRandom.normal([64, 1, k]).asType(.bfloat16)
+                lines.append(
+                    "\(tag) gather_sorted \(hash(gatherQuantizedMM(xs, wq, scales: scales, biases: biases, rhsIndices: sortedRhs, groupSize: g, bits: b, mode: mode, sortedIndices: true)))"
+                )
+            }
+        }
+        try lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
+        print("hash lines \(lines.count)")
+    }
+
 }

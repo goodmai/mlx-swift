@@ -903,6 +903,116 @@ METAL_FUNC void fp_qmv_wide_impl(
   }
 }
 
+// nf4 matrix-vector for M < vector_limit. Each simdgroup owns
+// results_per_simdgroup rows and each lane 8 codes of every 256-wide K block:
+// a row's codes go through NF4_LUT once, 4 at a time, and are applied to all
+// vecs_per_tg vectors, whose values stay in T to bound register pressure.
+template <
+    typename T,
+    int group_size,
+    int vecs_per_tg,
+    int results_per_simdgroup>
+METAL_FUNC void nf4_qmv_impl(
+    const device uint32_t* w,
+    const device half* scales,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    const int out_vec_size,
+    const int M,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row =
+      (tid.y * num_simdgroups + simd_gid) * results_per_simdgroup;
+  if (out_row >= out_vec_size) {
+    return;
+  }
+  const int last_row =
+      min(results_per_simdgroup - 1, out_vec_size - 1 - out_row);
+  const int vec0 = tid.x * vecs_per_tg;
+
+  const device uint8_t* ws = (const device uint8_t*)w +
+      out_row * in_vec_size_w + simd_lid * values_per_thread / 2;
+  scales +=
+      out_row * in_vec_size_g + simd_lid * values_per_thread / group_size;
+  const device T* xv[vecs_per_tg];
+  for (int v = 0; v < vecs_per_tg; v++) {
+    xv[v] = x + min(vec0 + v, M - 1) * in_vec_size +
+        simd_lid * values_per_thread;
+  }
+
+  thread T x_thread[vecs_per_tg][values_per_thread];
+  thread float result[vecs_per_tg][results_per_simdgroup];
+  for (int v = 0; v < vecs_per_tg; v++) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[v][row] = 0;
+    }
+  }
+
+  // Lanes past the end of a partial last block skip it.
+  const int k_end = in_vec_size - simd_lid * values_per_thread;
+  for (int k = 0; k < k_end; k += block_size) {
+#pragma unroll
+    for (int v = 0; v < vecs_per_tg; v++) {
+      load_vector<T, T, values_per_thread>(xv[v], x_thread[v]);
+      xv[v] += block_size;
+    }
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int src = min(row, last_row);
+      const device uint16_t* wq =
+          (const device uint16_t*)(ws + src * in_vec_size_w);
+      float acc[vecs_per_tg];
+#pragma unroll
+      for (int v = 0; v < vecs_per_tg; v++) {
+        acc[v] = 0;
+      }
+#pragma unroll
+      for (int i = 0; i < values_per_thread / 4; i++) {
+        const uint u = wq[i];
+        const float4 d = float4(
+            NF4_LUT[u & 0xf],
+            NF4_LUT[(u >> 4) & 0xf],
+            NF4_LUT[(u >> 8) & 0xf],
+            NF4_LUT[u >> 12]);
+#pragma unroll
+        for (int v = 0; v < vecs_per_tg; v++) {
+          acc[v] += dot(
+              d,
+              float4(
+                  x_thread[v][4 * i],
+                  x_thread[v][4 * i + 1],
+                  x_thread[v][4 * i + 2],
+                  x_thread[v][4 * i + 3]));
+        }
+      }
+      const float s = scales[src * in_vec_size_g];
+#pragma unroll
+      for (int v = 0; v < vecs_per_tg; v++) {
+        result[v][row] += s * acc[v];
+      }
+    }
+    ws += block_size / 2;
+    scales += block_size / group_size;
+  }
+
+  for (int v = 0; v < vecs_per_tg; v++) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const float r = simd_sum(result[v][row]);
+      if (simd_lid == 0 && row <= last_row && vec0 + v < M) {
+        y[(vec0 + v) * out_vec_size + out_row + row] = static_cast<T>(r);
+      }
+    }
+  }
+}
+
 template <
     typename T,
     int group_size,
@@ -1632,8 +1742,13 @@ template <
         s_strides,
         tid);
   }
-  fp_qmv_wide_impl<T, group_size, bits, vecs_per_tg, k_lanes>(
-      w, scales, x, y, in_vec_size, out_vec_size, M, tid, simd_gid, simd_lid);
+  if constexpr (is_nf4<S>()) {
+    nf4_qmv_impl<T, group_size, vecs_per_tg, (vecs_per_tg <= 2 ? 8 : 4)>(
+        w, scales, x, y, in_vec_size, out_vec_size, M, tid, simd_gid, simd_lid);
+  } else {
+    fp_qmv_wide_impl<T, group_size, bits, vecs_per_tg, k_lanes>(
+        w, scales, x, y, in_vec_size, out_vec_size, M, tid, simd_gid, simd_lid);
+  }
 }
 
 template <
@@ -1944,17 +2059,22 @@ template <
       w_strides,
       s_strides,
       tid);
-  fp_qmv_fast_impl<T, group_size, bits, false, has_global_scale>(
-      w,
-      scales,
-      global_scale,
-      x,
-      y,
-      in_vec_size,
-      out_vec_size,
-      tid,
-      simd_gid,
-      simd_lid);
+  if constexpr (is_nf4<S>()) {
+    nf4_qmv_impl<T, group_size, 1, 4>(
+        w, scales, x, y, in_vec_size, out_vec_size, M, tid, simd_gid, simd_lid);
+  } else {
+    fp_qmv_fast_impl<T, group_size, bits, false, has_global_scale>(
+        w,
+        scales,
+        global_scale,
+        x,
+        y,
+        in_vec_size,
+        out_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+  }
 }
 
 template <
@@ -2009,17 +2129,22 @@ template <
       w_strides,
       s_strides,
       tid);
-  fp_qmv_impl<T, group_size, bits, has_global_scale>(
-      w,
-      scales,
-      global_scale,
-      x,
-      y,
-      in_vec_size,
-      out_vec_size,
-      tid,
-      simd_gid,
-      simd_lid);
+  if constexpr (is_nf4<S>()) {
+    nf4_qmv_impl<T, group_size, 1, 4>(
+        w, scales, x, y, in_vec_size, out_vec_size, M, tid, simd_gid, simd_lid);
+  } else {
+    fp_qmv_impl<T, group_size, bits, has_global_scale>(
+        w,
+        scales,
+        global_scale,
+        x,
+        y,
+        in_vec_size,
+        out_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+  }
 }
 
 template <
