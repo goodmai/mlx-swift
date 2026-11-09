@@ -481,12 +481,15 @@ class QuantizationTests: XCTestCase {
             (5120, 17408), (17408, 5120), (5120, 10240), (6144, 5120),
             (2816, 262_144), (2816, 2112), (2112, 2816), (2816, 4096), (4096, 2816),
             (2048, 65536), (2048, 2048),
+            (2048, 6144), (2048, 512), (2048, 11776), (11776, 2048),
         ]
         let shapes =
-            ProcessInfo.processInfo.environment["MLX_NF4_BENCH_SHAPES"] == "small"
-            ? Array(allShapes[4...])
-            : ProcessInfo.processInfo.environment["MLX_NF4_BENCH_SHAPES"] == "all"
-                ? allShapes : Array(allShapes[..<4])
+            ProcessInfo.processInfo.environment["MLX_NF4_BENCH_SHAPES"] == "lfm"
+            ? Array(allShapes[10...])
+            : ProcessInfo.processInfo.environment["MLX_NF4_BENCH_SHAPES"] == "small"
+                ? Array(allShapes[4...])
+                : ProcessInfo.processInfo.environment["MLX_NF4_BENCH_SHAPES"] == "all"
+                    ? allShapes : Array(allShapes[..<4])
         let configurations: [(QuantizationMode, Int)] =
             ProcessInfo.processInfo.environment["MLX_NF4_BENCH_MXFP4"] == "1"
             ? [(.nf4, 32), (.affine, 64), (.mxfp4, 32)] : [(.nf4, 32), (.affine, 64)]
@@ -667,6 +670,77 @@ class QuantizationTests: XCTestCase {
         }
         try lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
         print("hash lines \(lines.count)")
+    }
+
+    func testNF4ChainLatencyBenchmark() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MLX_NF4_BENCH"] == "1", "set MLX_NF4_BENCH=1")
+        let env = ProcessInfo.processInfo.environment
+        let reps = Int(env["MLX_NF4_BENCH_REPS"] ?? "5") ?? 5
+        let chain = 64
+        let pairs: [(Int, Int, Int, Int)] = [
+            (1, 1, 2048, 2048), (1, 1, 2048, 6144), (1, 1, 2048, 11776), (1, 1, 2816, 2112),
+            (1, 1, 5120, 17408), (1, 2, 5120, 17408), (1, 2, 2048, 6144),
+            (64, 4, 2048, 1536), (128, 8, 2816, 704),
+        ]
+        func median(_ body: () -> Void) -> Double {
+            let clock = ContinuousClock()
+            let times = (0 ..< 7).map { _ in
+                let elapsed = clock.measure(body)
+                return Double(elapsed.components.seconds) * 1e6
+                    + Double(elapsed.components.attoseconds) / 1e12
+            }
+            return times.sorted()[3]
+        }
+        print("chain E/topk|M K<->N | nf4 g32 us/call | affine g64 us/call | nf4/affine")
+        for (experts, rows, k, n) in pairs {
+            MLXRandom.seed(2)
+            let gather = experts > 1
+            let shape: (Int, Int) -> [Int] = { o, i in gather ? [experts, o, i] : [o, i] }
+            let up = MLXRandom.normal(shape(n, k), dtype: .bfloat16) * 0.02
+            let down = MLXRandom.normal(shape(k, n), dtype: .bfloat16) * 0.02
+            let x = MLXRandom.normal(gather ? [rows, 1, k] : [rows, k], dtype: .bfloat16)
+            let picks = (0 ..< chain).map { c in
+                MLXArray((0 ..< rows).map { UInt32(($0 * 37 + c * 11) % experts) })
+            }
+            var measures: [() -> Double] = []
+            for (mode, groupSize) in [(QuantizationMode.nf4, 32), (.affine, 64)] {
+                let copies = (0 ..< max(1, (256 << 20) / (n * k * experts))).map { _ in
+                    (
+                        MLX.quantized(up + 0, groupSize: groupSize, bits: 4, mode: mode),
+                        MLX.quantized(down + 0, groupSize: groupSize, bits: 4, mode: mode)
+                    )
+                }
+                eval(copies.flatMap { [$0.0.wq, $0.0.scales, $0.1.wq, $0.1.scales] })
+                let run = {
+                    var y = x
+                    for c in 0 ..< chain {
+                        let (a, b) = copies[c % copies.count]
+                        let w = c % 2 == 0 ? a : b
+                        y =
+                            gather
+                            ? gatherQuantizedMM(
+                                y, w.wq, scales: w.scales, biases: w.biases, rhsIndices: picks[c],
+                                groupSize: groupSize, bits: 4, mode: mode)
+                            : quantizedMM(
+                                y, w.wq, scales: w.scales, biases: w.biases, groupSize: groupSize,
+                                bits: 4, mode: mode)
+                    }
+                    eval(y)
+                }
+                run()
+                measures.append { median(run) / Double(chain) }
+            }
+            var samples = Array(repeating: [Double](), count: measures.count)
+            for _ in 0 ..< reps {
+                for (i, measure) in measures.enumerated() { samples[i].append(measure()) }
+            }
+            let micros = samples.map { $0.sorted()[$0.count / 2] }
+            print(
+                "\(experts)/\(rows) \(k)<->\(n) | "
+                    + String(
+                        format: "%.2f | %.2f | %.3f", micros[0], micros[1], micros[0] / micros[1]))
+        }
     }
 
 }

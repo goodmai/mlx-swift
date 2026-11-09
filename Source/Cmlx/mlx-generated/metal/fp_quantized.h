@@ -1580,7 +1580,7 @@ template <
         tid);
   }
   if constexpr (is_nf4<S>()) {
-    nf4_qmv_impl<T, group_size, vecs_per_tg, (vecs_per_tg <= 2 ? 8 : 4)>(
+    nf4_qmv_impl<T, group_size, vecs_per_tg, (vecs_per_tg == 2 ? 8 : 4)>(
         w, scales, x, y, in_vec_size, out_vec_size, M, tid, simd_gid, simd_lid);
   } else {
     fp_qmv_wide_impl<T, group_size, bits, vecs_per_tg, k_lanes>(
